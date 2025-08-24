@@ -4,7 +4,7 @@ const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { Low, JSONFile } = require('lowdb');
-const { v4: uuidv4 } = require('uuid');
+const crypto = require('crypto'); // Use built-in crypto module instead of uuid
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -21,6 +21,11 @@ app.use(bodyParser.json());
 const adapter = new JSONFile('./db.json');
 const db = new Low(adapter);
 
+// Generate UUID using crypto module
+function generateUUID() {
+  return crypto.randomUUID();
+}
+
 // Initialize database
 async function initializeDB() {
   await db.read();
@@ -36,7 +41,7 @@ async function initializeDB() {
   if (db.data.admin_users.length === 0) {
     const passwordHash = bcrypt.hashSync('admin123', 10);
     db.data.admin_users.push({
-      id: uuidv4(),
+      id: generateUUID(),
       username: 'admin',
       password_hash: passwordHash,
       created_at: new Date().toISOString()
@@ -47,13 +52,13 @@ async function initializeDB() {
   if (db.data.licenses.length === 0) {
     db.data.licenses.push(
       {
-        id: uuidv4(),
+        id: generateUUID(),
         license_key: 'LICENSE-001',
         created_at: new Date().toISOString(),
         is_active: true
       },
       {
-        id: uuidv4(),
+        id: generateUUID(),
         license_key: 'LICENSE-002',
         created_at: new Date().toISOString(),
         is_active: true
@@ -66,6 +71,7 @@ async function initializeDB() {
 
 // Initialize database on server start
 initializeDB();
+
 
 // Authentication middleware
 const authenticateToken = (req, res, next) => {
@@ -130,7 +136,7 @@ app.post('/api/verify-license', async (req, res) => {
   } else {
     // Create new device
     db.data.devices.push({
-      id: uuidv4(),
+      id: generateUUID(),
       device_id,
       license_key,
       user_agent,
@@ -226,7 +232,7 @@ app.post('/api/licenses', authenticateToken, async (req, res) => {
   
   // Create new license
   const newLicense = {
-    id: uuidv4(),
+    id: generateUUID(),
     license_key,
     created_at: new Date().toISOString(),
     is_active: true
