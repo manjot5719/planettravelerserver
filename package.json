@@ -4,21 +4,20 @@
   "description": "License server for Planet Traveler",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "install": "npm rebuild --build-from-source"
+    "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.18.2",
     "body-parser": "^1.20.2",
     "cors": "^2.8.5",
     "sqlite3": "^5.1.6",
-    "bcrypt": "^5.1.1",
+    "bcryptjs": "^2.4.3",
     "jsonwebtoken": "^9.0.2"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "engines": {
-    "node": "18.x"
+    "node": "20.x"
   }
 }
