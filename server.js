@@ -1,9 +1,10 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const cors = require('cors');
-const sqlite3 = require('sqlite3').verbose();
-const bcrypt = require('bcryptjs'); // Changed to bcryptjs
+const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const { Low, JSONFile } = require('lowdb');
+const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -16,47 +17,55 @@ app.use(cors({
 }));
 app.use(bodyParser.json());
 
-// Database setup - using in-memory database
-const db = new sqlite3.Database(':memory:');
+// Database setup - using LowDB with in-memory storage
+const adapter = new JSONFile('./db.json');
+const db = new Low(adapter);
 
-// Initialize database tables
-db.serialize(() => {
-  // Licenses table
-  db.run(`CREATE TABLE licenses (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    license_key TEXT UNIQUE,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    is_active BOOLEAN DEFAULT 1
-  )`);
+// Initialize database
+async function initializeDB() {
+  await db.read();
   
-  // Devices table
-  db.run(`CREATE TABLE devices (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    device_id TEXT UNIQUE,
-    license_key TEXT,
-    user_agent TEXT,
-    last_seen DATETIME,
-    is_blocked BOOLEAN DEFAULT 0,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(license_key) REFERENCES licenses(license_key)
-  )`);
+  // Set default data if empty
+  db.data ||= { 
+    licenses: [],
+    devices: [],
+    admin_users: []
+  };
   
-  // Admin users table
-  db.run(`CREATE TABLE admin_users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE,
-    password_hash TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )`);
+  // Check if admin user exists, if not create it
+  if (db.data.admin_users.length === 0) {
+    const passwordHash = bcrypt.hashSync('admin123', 10);
+    db.data.admin_users.push({
+      id: uuidv4(),
+      username: 'admin',
+      password_hash: passwordHash,
+      created_at: new Date().toISOString()
+    });
+  }
   
-  // Insert default admin user (username: admin, password: admin123)
-  const passwordHash = bcrypt.hashSync('admin123', 10);
-  db.run(`INSERT INTO admin_users (username, password_hash) VALUES (?, ?)`, ['admin', passwordHash]);
+  // Check if sample licenses exist
+  if (db.data.licenses.length === 0) {
+    db.data.licenses.push(
+      {
+        id: uuidv4(),
+        license_key: 'LICENSE-001',
+        created_at: new Date().toISOString(),
+        is_active: true
+      },
+      {
+        id: uuidv4(),
+        license_key: 'LICENSE-002',
+        created_at: new Date().toISOString(),
+        is_active: true
+      }
+    );
+  }
   
-  // Insert some sample licenses
-  db.run(`INSERT INTO licenses (license_key) VALUES (?)`, ['LICENSE-001']);
-  db.run(`INSERT INTO licenses (license_key) VALUES (?)`, ['LICENSE-002']);
-});
+  await db.write();
+}
+
+// Initialize database on server start
+initializeDB();
 
 // Authentication middleware
 const authenticateToken = (req, res, next) => {
@@ -77,178 +86,209 @@ const authenticateToken = (req, res, next) => {
 };
 
 // Admin login endpoint
-app.post('/api/admin/login', (req, res) => {
+app.post('/api/admin/login', async (req, res) => {
   const { username, password } = req.body;
   
-  db.get('SELECT * FROM admin_users WHERE username = ?', [username], (err, user) => {
-    if (err) {
-      return res.status(500).json({ error: 'Database error' });
-    }
-    
-    if (!user || !bcrypt.compareSync(password, user.password_hash)) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-    
-    const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '24h' });
-    res.json({ token });
-  });
+  await db.read();
+  const user = db.data.admin_users.find(u => u.username === username);
+  
+  if (!user || !bcrypt.compareSync(password, user.password_hash)) {
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
+  
+  const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '24h' });
+  res.json({ token });
 });
 
 // Verify license endpoint (used by client script)
-app.post('/api/verify-license', (req, res) => {
+app.post('/api/verify-license', async (req, res) => {
   const { license_key, device_id, user_agent } = req.body;
   
+  await db.read();
+  
   // Check if license exists and is active
-  db.get('SELECT * FROM licenses WHERE license_key = ? AND is_active = 1', [license_key], (err, license) => {
-    if (err) {
-      return res.status(500).json({ error: 'Database error' });
-    }
-    
-    if (!license) {
-      return res.status(404).json({ error: 'Invalid or inactive license' });
-    }
-    
-    // Check if device is blocked
-    db.get('SELECT * FROM devices WHERE device_id = ? AND is_blocked = 1', [device_id], (err, device) => {
-      if (err) {
-        return res.status(500).json({ error: 'Database error' });
-      }
-      
-      if (device) {
-        return res.status(403).json({ error: 'Device is blocked' });
-      }
-      
-      // Update or create device record
-      db.run(
-        `INSERT INTO devices (device_id, license_key, user_agent, last_seen) 
-         VALUES (?, ?, ?, datetime('now')) 
-         ON CONFLICT(device_id) 
-         DO UPDATE SET last_seen = datetime('now')`,
-        [device_id, license_key, user_agent],
-        function(err) {
-          if (err) {
-            return res.status(500).json({ error: 'Database error' });
-          }
-          
-          res.json({ valid: true, message: 'License is valid' });
-        }
-      );
+  const license = db.data.licenses.find(l => l.license_key === license_key && l.is_active);
+  
+  if (!license) {
+    return res.status(404).json({ error: 'Invalid or inactive license' });
+  }
+  
+  // Check if device is blocked
+  const device = db.data.devices.find(d => d.device_id === device_id && d.is_blocked);
+  
+  if (device) {
+    return res.status(403).json({ error: 'Device is blocked' });
+  }
+  
+  // Update or create device record
+  const existingDeviceIndex = db.data.devices.findIndex(d => d.device_id === device_id);
+  
+  if (existingDeviceIndex !== -1) {
+    // Update existing device
+    db.data.devices[existingDeviceIndex].last_seen = new Date().toISOString();
+    db.data.devices[existingDeviceIndex].user_agent = user_agent;
+  } else {
+    // Create new device
+    db.data.devices.push({
+      id: uuidv4(),
+      device_id,
+      license_key,
+      user_agent,
+      last_seen: new Date().toISOString(),
+      is_blocked: false,
+      created_at: new Date().toISOString()
     });
-  });
+  }
+  
+  await db.write();
+  res.json({ valid: true, message: 'License is valid' });
 });
 
 // Get all devices (admin only)
-app.get('/api/devices', authenticateToken, (req, res) => {
-  db.all(`
-    SELECT d.*, l.created_at as license_created 
-    FROM devices d 
-    LEFT JOIN licenses l ON d.license_key = l.license_key 
-    ORDER BY d.last_seen DESC
-  `, (err, rows) => {
-    if (err) {
-      return res.status(500).json({ error: 'Database error' });
-    }
-    res.json(rows);
+app.get('/api/devices', authenticateToken, async (req, res) => {
+  await db.read();
+  
+  // Add license creation date to each device
+  const devicesWithLicenseInfo = db.data.devices.map(device => {
+    const license = db.data.licenses.find(l => l.license_key === device.license_key);
+    return {
+      ...device,
+      license_created: license ? license.created_at : null
+    };
   });
+  
+  // Sort by last seen (newest first)
+  devicesWithLicenseInfo.sort((a, b) => new Date(b.last_seen) - new Date(a.last_seen));
+  
+  res.json(devicesWithLicenseInfo);
 });
 
 // Get all licenses (admin only)
-app.get('/api/licenses', authenticateToken, (req, res) => {
-  db.all(`
-    SELECT l.*, COUNT(d.id) as device_count 
-    FROM licenses l 
-    LEFT JOIN devices d ON l.license_key = d.license_key 
-    GROUP BY l.id
-  `, (err, rows) => {
-    if (err) {
-      return res.status(500).json({ error: 'Database error' });
-    }
-    res.json(rows);
+app.get('/api/licenses', authenticateToken, async (req, res) => {
+  await db.read();
+  
+  // Add device count to each license
+  const licensesWithDeviceCount = db.data.licenses.map(license => {
+    const deviceCount = db.data.devices.filter(d => d.license_key === license.license_key).length;
+    return {
+      ...license,
+      device_count: deviceCount
+    };
   });
+  
+  res.json(licensesWithDeviceCount);
 });
 
 // Block a device (admin only)
-app.post('/api/block-device', authenticateToken, (req, res) => {
+app.post('/api/block-device', authenticateToken, async (req, res) => {
   const { device_id } = req.body;
   
-  db.run('UPDATE devices SET is_blocked = 1 WHERE device_id = ?', [device_id], function(err) {
-    if (err) {
-      return res.status(500).json({ error: 'Database error' });
-    }
-    
-    if (this.changes === 0) {
-      return res.status(404).json({ error: 'Device not found' });
-    }
-    
-    res.json({ message: 'Device blocked successfully' });
-  });
+  await db.read();
+  const deviceIndex = db.data.devices.findIndex(d => d.device_id === device_id);
+  
+  if (deviceIndex === -1) {
+    return res.status(404).json({ error: 'Device not found' });
+  }
+  
+  db.data.devices[deviceIndex].is_blocked = true;
+  await db.write();
+  
+  res.json({ message: 'Device blocked successfully' });
 });
 
 // Unblock a device (admin only)
-app.post('/api/unblock-device', authenticateToken, (req, res) => {
+app.post('/api/unblock-device', authenticateToken, async (req, res) => {
   const { device_id } = req.body;
   
-  db.run('UPDATE devices SET is_blocked = 0 WHERE device_id = ?', [device_id], function(err) {
-    if (err) {
-      return res.status(500).json({ error: 'Database error' });
-    }
-    
-    if (this.changes === 0) {
-      return res.status(404).json({ error: 'Device not found' });
-    }
-    
-    res.json({ message: 'Device unblocked successfully' });
-  });
+  await db.read();
+  const deviceIndex = db.data.devices.findIndex(d => d.device_id === device_id);
+  
+  if (deviceIndex === -1) {
+    return res.status(404).json({ error: 'Device not found' });
+  }
+  
+  db.data.devices[deviceIndex].is_blocked = false;
+  await db.write();
+  
+  res.json({ message: 'Device unblocked successfully' });
 });
 
 // Create a new license (admin only)
-app.post('/api/licenses', authenticateToken, (req, res) => {
+app.post('/api/licenses', authenticateToken, async (req, res) => {
   const { license_key } = req.body;
   
-  db.run('INSERT INTO licenses (license_key) VALUES (?)', [license_key], function(err) {
-    if (err) {
-      if (err.message.includes('UNIQUE constraint failed')) {
-        return res.status(409).json({ error: 'License key already exists' });
-      }
-      return res.status(500).json({ error: 'Database error' });
-    }
-    
-    res.json({ message: 'License created successfully', id: this.lastID });
-  });
+  await db.read();
+  
+  // Check if license already exists
+  if (db.data.licenses.some(l => l.license_key === license_key)) {
+    return res.status(409).json({ error: 'License key already exists' });
+  }
+  
+  // Create new license
+  const newLicense = {
+    id: uuidv4(),
+    license_key,
+    created_at: new Date().toISOString(),
+    is_active: true
+  };
+  
+  db.data.licenses.push(newLicense);
+  await db.write();
+  
+  res.json({ message: 'License created successfully', id: newLicense.id });
 });
 
 // Deactivate a license (admin only)
-app.post('/api/deactivate-license', authenticateToken, (req, res) => {
+app.post('/api/deactivate-license', authenticateToken, async (req, res) => {
   const { license_key } = req.body;
   
-  db.run('UPDATE licenses SET is_active = 0 WHERE license_key = ?', [license_key], function(err) {
-    if (err) {
-      return res.status(500).json({ error: 'Database error' });
-    }
-    
-    if (this.changes === 0) {
-      return res.status(404).json({ error: 'License not found' });
-    }
-    
-    res.json({ message: 'License deactivated successfully' });
-  });
+  await db.read();
+  const licenseIndex = db.data.licenses.findIndex(l => l.license_key === license_key);
+  
+  if (licenseIndex === -1) {
+    return res.status(404).json({ error: 'License not found' });
+  }
+  
+  db.data.licenses[licenseIndex].is_active = false;
+  await db.write();
+  
+  res.json({ message: 'License deactivated successfully' });
 });
 
 // Reactivate a license (admin only)
-app.post('/api/reactivate-license', authenticateToken, (req, res) => {
+app.post('/api/reactivate-license', authenticateToken, async (req, res) => {
   const { license_key } = req.body;
   
-  db.run('UPDATE licenses SET is_active = 1 WHERE license_key = ?', [license_key], function(err) {
-    if (err) {
-      return res.status(500).json({ error: 'Database error' });
-    }
-    
-    if (this.changes === 0) {
-      return res.status(404).json({ error: 'License not found' });
-    }
-    
-    res.json({ message: 'License reactivated successfully' });
-  });
+  await db.read();
+  const licenseIndex = db.data.licenses.findIndex(l => l.license_key === license_key);
+  
+  if (licenseIndex === -1) {
+    return res.status(404).json({ error: 'License not found' });
+  }
+  
+  db.data.licenses[licenseIndex].is_active = true;
+  await db.write();
+  
+  res.json({ message: 'License reactivated successfully' });
+});
+
+// Change admin password endpoint
+app.post('/api/admin/change-password', authenticateToken, async (req, res) => {
+  const { oldPassword, newPassword } = req.body;
+  const username = req.user.username;
+
+  await db.read();
+  const userIndex = db.data.admin_users.findIndex(u => u.username === username);
+  
+  if (userIndex === -1 || !bcrypt.compareSync(oldPassword, db.data.admin_users[userIndex].password_hash)) {
+    return res.status(401).json({ error: 'Invalid old password' });
+  }
+
+  const newHash = bcrypt.hashSync(newPassword, 10);
+  db.data.admin_users[userIndex].password_hash = newHash;
+  await db.write();
+  
+  res.json({ message: 'Password updated successfully' });
 });
 
 // Serve admin panel
@@ -989,4 +1029,6 @@ app.get('/admin', (req, res) => {
 // Start server
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  console.log(`Health check: http://localhost:${PORT}/health`);
+  console.log(`Admin portal: http://localhost:${PORT}/admin`);
 });
