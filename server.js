@@ -4,7 +4,6 @@ const cors = require('cors');
 const sqlite3 = require('sqlite3').verbose();
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
-const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -16,10 +15,9 @@ app.use(cors({
     credentials: true
 }));
 app.use(bodyParser.json());
-app.use(express.static('public'));
 
-// Database setup - using persistent file
-const db = new sqlite3.Database(':memory:'); // Use in-memory for Render compatibility
+// Database setup - using in-memory database
+const db = new sqlite3.Database(':memory:');
 
 // Initialize database tables
 db.serialize(() => {
