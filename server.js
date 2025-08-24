@@ -1,180 +1,312 @@
 const express = require('express');
+const bodyParser = require('body-parser');
 const cors = require('cors');
-const admin = require('firebase-admin');
+const sqlite3 = require('sqlite3').verbose();
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const path = require('path');
+
 const app = express();
+const PORT = process.env.PORT || 3000;
+const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 
-// Initialize Firebase using environment variables
-// Note: We'll set up the Firebase Admin SDK properly later
-// For now, we'll use a simple in-memory database
+// Middleware
+app.use(cors({
+    origin: ['http://localhost', 'http://127.0.0.1', 'file://'], // Allow local file access
+    credentials: true
+}));
+app.use(bodyParser.json());
+app.use(express.static('public'));
 
-// Enable CORS for browser requests
-app.use(cors());
-app.use(express.json());
+// Database setup - using persistent file
+const db = new sqlite3.Database(path.join(__dirname, 'database.db'));
 
-// Simple in-memory database for licenses (will replace with Firebase later)
-let licenses = {};
-let users = {};
-
-// Root endpoint
-app.get('/', (req, res) => {
-  res.send('Planet Traveler License Server is running!');
-});
-
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'OK', 
-    timestamp: new Date(),
-    server: 'Planet Traveler License Server',
-    version: '1.0.0'
-  });
-});
-
-// License validation endpoint
-app.post('/validate', async (req, res) => {
-  const { licenseKey, deviceId } = req.body;
+// Initialize database tables
+db.serialize(() => {
+  // Licenses table
+  db.run(`CREATE TABLE IF NOT EXISTS licenses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    license_key TEXT UNIQUE,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    is_active BOOLEAN DEFAULT 1
+  )`);
   
-  console.log('License validation request:', { licenseKey, deviceId });
+  // Devices table
+  db.run(`CREATE TABLE IF NOT EXISTS devices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id TEXT UNIQUE,
+    license_key TEXT,
+    user_agent TEXT,
+    last_seen DATETIME,
+    is_blocked BOOLEAN DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(license_key) REFERENCES licenses(license_key)
+  )`);
   
-  // Check if license exists
-  if (!licenses[licenseKey]) {
-    return res.json({ 
-      valid: false, 
-      error: 'Invalid license key',
-      code: 'INVALID_LICENSE'
-    });
-  }
+  // Admin users table
+  db.run(`CREATE TABLE IF NOT EXISTS admin_users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE,
+    password_hash TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
   
-  const license = licenses[licenseKey];
-  
-  // Check if license is expired
-  if (new Date(license.validUntil) < new Date()) {
-    return res.json({ 
-      valid: false, 
-      error: 'License expired',
-      code: 'LICENSE_EXPIRED'
-    });
-  }
-  
-  // Check if device is already registered
-  const existingDevice = license.devices.find(d => d.id === deviceId);
-  
-  if (!existingDevice) {
-    // New device - check if we can add it
-    if (license.devices.length >= license.maxDevices) {
-      return res.json({ 
-        valid: false, 
-        error: 'Device limit reached',
-        code: 'DEVICE_LIMIT'
-      });
+  // Check if admin user exists, if not create it
+  db.get('SELECT COUNT(*) as count FROM admin_users', (err, row) => {
+    if (err) {
+      console.error('Error checking admin users:', err);
+      return;
     }
     
-    // Register new device
-    license.devices.push({
-      id: deviceId,
-      firstSeen: new Date(),
-      lastSeen: new Date()
-    });
-  } else {
-    // Update existing device
-    existingDevice.lastSeen = new Date();
-  }
+    if (row.count === 0) {
+      const passwordHash = bcrypt.hashSync('admin123', 10);
+      db.run(`INSERT INTO admin_users (username, password_hash) VALUES (?, ?)`, ['admin', passwordHash], function(err) {
+        if (err) {
+          console.error('Error creating admin user:', err);
+        } else {
+          console.log('Default admin user created');
+        }
+      });
+    }
+  });
   
-  // Update user record
-  users[deviceId] = {
-    licenseKey: licenseKey,
-    lastSeen: new Date()
-  };
-  
-  res.json({
-    valid: true,
-    validUntil: license.validUntil,
-    maxDevices: license.maxDevices,
-    usedDevices: license.devices.length
+  // Insert some sample licenses if none exist
+  db.get('SELECT COUNT(*) as count FROM licenses', (err, row) => {
+    if (err) {
+      console.error('Error checking licenses:', err);
+      return;
+    }
+    
+    if (row.count === 0) {
+      db.run(`INSERT INTO licenses (license_key) VALUES (?)`, ['LICENSE-001']);
+      db.run(`INSERT INTO licenses (license_key) VALUES (?)`, ['LICENSE-002']);
+      console.log('Sample licenses created');
+    }
   });
 });
 
-// Admin endpoint to add licenses
-app.post('/admin/add-license', async (req, res) => {
-  const { password, key, maxDevices, validUntil } = req.body;
+// Authentication middleware
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
   
-  // Simple password protection
-  if (password !== process.env.ADMIN_PASSWORD) {
-    return res.status(401).json({ error: 'Unauthorized' });
+  if (!token) {
+    return res.status(401).json({ error: 'Access token required' });
   }
   
-  if (!key) {
-    return res.status(400).json({ error: 'License key is required' });
-  }
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(403).json({ error: 'Invalid or expired token' });
+    }
+    req.user = user;
+    next();
+  });
+};
+
+// Admin login endpoint
+app.post('/api/admin/login', (req, res) => {
+  const { username, password } = req.body;
   
-  try {
-    licenses[key] = {
-      maxDevices: parseInt(maxDevices) || 1,
-      devices: [],
-      validUntil: validUntil || '2024-12-31',
-      createdAt: new Date()
-    };
+  db.get('SELECT * FROM admin_users WHERE username = ?', [username], (err, user) => {
+    if (err) {
+      return res.status(500).json({ error: 'Database error' });
+    }
     
-    res.json({ 
-      success: true, 
-      message: 'License added',
-      license: licenses[key]
-    });
+    if (!user || !bcrypt.compareSync(password, user.password_hash)) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
     
-  } catch (error) {
-    console.error('Add license error:', error);
-    res.status(500).json({ error: 'Failed to add license' });
-  }
+    const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '24h' });
+    res.json({ token });
+  });
 });
 
-// Get all licenses (admin)
-app.get('/admin/licenses', async (req, res) => {
-  const { password } = req.query;
+// Verify license endpoint (used by client script)
+app.post('/api/verify-license', (req, res) => {
+  const { license_key, device_id, user_agent } = req.body;
   
-  if (password !== process.env.ADMIN_PASSWORD) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  
-  try {
-    res.json({
-      success: true,
-      licenses: licenses,
-      users: users,
-      serverTime: new Date()
-    });
+  // Check if license exists and is active
+  db.get('SELECT * FROM licenses WHERE license_key = ? AND is_active = 1', [license_key], (err, license) => {
+    if (err) {
+      return res.status(500).json({ error: 'Database error' });
+    }
     
-  } catch (error) {
-    console.error('Get licenses error:', error);
-    res.status(500).json({ error: 'Failed to get licenses' });
-  }
+    if (!license) {
+      return res.status(404).json({ error: 'Invalid or inactive license' });
+    }
+    
+    // Check if device is blocked
+    db.get('SELECT * FROM devices WHERE device_id = ? AND is_blocked = 1', [device_id], (err, device) => {
+      if (err) {
+        return res.status(500).json({ error: 'Database error' });
+      }
+      
+      if (device) {
+        return res.status(403).json({ error: 'Device is blocked' });
+      }
+      
+      // Update or create device record
+      db.run(
+        `INSERT INTO devices (device_id, license_key, user_agent, last_seen) 
+         VALUES (?, ?, ?, datetime('now')) 
+         ON CONFLICT(device_id) 
+         DO UPDATE SET last_seen = datetime('now')`,
+        [device_id, license_key, user_agent],
+        function(err) {
+          if (err) {
+            return res.status(500).json({ error: 'Database error' });
+          }
+          
+          res.json({ valid: true, message: 'License is valid' });
+        }
+      );
+    });
+  });
 });
 
-// Reset all data (for testing only)
-app.post('/admin/reset', async (req, res) => {
-  const { password } = req.body;
-  
-  if (password !== process.env.ADMIN_PASSWORD) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  
-  try {
-    licenses = {};
-    users = {};
-    
-    res.json({ 
-      success: true, 
-      message: 'All data reset successfully' 
-    });
-    
-  } catch (error) {
-    console.error('Reset error:', error);
-    res.status(500).json({ error: 'Failed to reset data' });
-  }
+// Get all devices (admin only)
+app.get('/api/devices', authenticateToken, (req, res) => {
+  db.all(`
+    SELECT d.*, l.created_at as license_created 
+    FROM devices d 
+    LEFT JOIN licenses l ON d.license_key = l.license_key 
+    ORDER BY d.last_seen DESC
+  `, (err, rows) => {
+    if (err) {
+      return res.status(500).json({ error: 'Database error' });
+    }
+    res.json(rows);
+  });
 });
 
-const PORT = process.env.PORT || 3000;
+// Get all licenses (admin only)
+app.get('/api/licenses', authenticateToken, (req, res) => {
+  db.all(`
+    SELECT l.*, COUNT(d.id) as device_count 
+    FROM licenses l 
+    LEFT JOIN devices d ON l.license_key = d.license_key 
+    GROUP BY l.id
+  `, (err, rows) => {
+    if (err) {
+      return res.status(500).json({ error: 'Database error' });
+    }
+    res.json(rows);
+  });
+});
+
+// Block a device (admin only)
+app.post('/api/block-device', authenticateToken, (req, res) => {
+  const { device_id } = req.body;
+  
+  db.run('UPDATE devices SET is_blocked = 1 WHERE device_id = ?', [device_id], function(err) {
+    if (err) {
+      return res.status(500).json({ error: 'Database error' });
+    }
+    
+    if (this.changes === 0) {
+      return res.status(404).json({ error: 'Device not found' });
+    }
+    
+    res.json({ message: 'Device blocked successfully' });
+  });
+});
+
+// Unblock a device (admin only)
+app.post('/api/unblock-device', authenticateToken, (req, res) => {
+  const { device_id } = req.body;
+  
+  db.run('UPDATE devices SET is_blocked = 0 WHERE device_id = ?', [device_id], function(err) {
+    if (err) {
+      return res.status(500).json({ error: 'Database error' });
+    }
+    
+    if (this.changes === 0) {
+      return res.status(404).json({ error: 'Device not found' });
+    }
+    
+    res.json({ message: 'Device unblocked successfully' });
+  });
+});
+
+// Create a new license (admin only)
+app.post('/api/licenses', authenticateToken, (req, res) => {
+  const { license_key } = req.body;
+  
+  db.run('INSERT INTO licenses (license_key) VALUES (?)', [license_key], function(err) {
+    if (err) {
+      if (err.message.includes('UNIQUE constraint failed')) {
+        return res.status(409).json({ error: 'License key already exists' });
+      }
+      return res.status(500).json({ error: 'Database error' });
+    }
+    
+    res.json({ message: 'License created successfully', id: this.lastID });
+  });
+});
+
+// Deactivate a license (admin only)
+app.post('/api/deactivate-license', authenticateToken, (req, res) => {
+  const { license_key } = req.body;
+  
+  db.run('UPDATE licenses SET is_active = 0 WHERE license_key = ?', [license_key], function(err) {
+    if (err) {
+      return res.status(500).json({ error: 'Database error' });
+    }
+    
+    if (this.changes === 0) {
+      return res.status(404).json({ error: 'License not found' });
+    }
+    
+    res.json({ message: 'License deactivated successfully' });
+  });
+});
+
+// Reactivate a license (admin only)
+app.post('/api/reactivate-license', authenticateToken, (req, res) => {
+  const { license_key } = req.body;
+  
+  db.run('UPDATE licenses SET is_active = 1 WHERE license_key = ?', [license_key], function(err) {
+    if (err) {
+      return res.status(500).json({ error: 'Database error' });
+    }
+    
+    if (this.changes === 0) {
+      return res.status(404).json({ error: 'License not found' });
+    }
+    
+    res.json({ message: 'License reactivated successfully' });
+  });
+});
+
+// Change admin password endpoint
+app.post('/api/admin/change-password', authenticateToken, (req, res) => {
+  const { oldPassword, newPassword } = req.body;
+  const username = req.user.username;
+
+  db.get('SELECT * FROM admin_users WHERE username = ?', [username], (err, user) => {
+    if (err) {
+      return res.status(500).json({ error: 'Database error' });
+    }
+    if (!user || !bcrypt.compareSync(oldPassword, user.password_hash)) {
+      return res.status(401).json({ error: 'Invalid old password' });
+    }
+
+    const newHash = bcrypt.hashSync(newPassword, 10);
+    db.run('UPDATE admin_users SET password_hash = ? WHERE username = ?', [newHash, username], function(err) {
+      if (err) {
+        return res.status(500).json({ error: 'Database error' });
+      }
+      res.json({ message: 'Password updated successfully' });
+    });
+  });
+});
+
+// Serve admin panel
+app.get('/admin', (req, res) => {
+  res.sendFile(path.join(__dirname, 'admin.html'));
+});
+
+// Start server
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
-  console.log(`Admin portal: http://localhost:${PORT}/admin/licenses?password=YOUR_PASSWORD`);
 });
